@@ -1,0 +1,40 @@
+use crate::{
+    core::crypto::KeyEncrypter,
+    env::observability as logger,
+    errors::{self, SwitchError},
+    multitenancy::TenantState,
+    storage::{dek::DataKeyStorageInterface, metrics as storage_metrics},
+    types::{Key, key::Version, requests::CreateDataKeyRequest, response::DataKeyCreateResponse},
+};
+
+pub async fn generate_and_create_data_key(
+    state: TenantState,
+    req: CreateDataKeyRequest,
+) -> errors::CustomResult<DataKeyCreateResponse, errors::ApplicationErrorResponse> {
+    let db = state.get_db_pool();
+    let version = Version::get_latest(&req.identifier, &state).await;
+
+    let (source, aes_key) = state.keymanager_client.generate_key().await.switch()?;
+
+    let key = Key {
+        version,
+        identifier: req.identifier.clone(),
+        key: aes_key,
+        source,
+    }
+    .encrypt(&state)
+    .await
+    .switch()
+    .map_err(|err| {
+        logger::error!(?err);
+        err
+    })?;
+    let data_key = db
+        .get_or_insert_data_key(storage_metrics::DataKeyStorageOperation::Create, key)
+        .await
+        .switch()?;
+    Ok(DataKeyCreateResponse {
+        key_version: data_key.version,
+        identifier: req.identifier,
+    })
+}
